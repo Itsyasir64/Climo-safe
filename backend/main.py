@@ -1,9 +1,13 @@
-
 """Climo-Safe environmental monitoring API."""
 
-from fastapi import FastAPI, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
+from collections import defaultdict
+from time import monotonic
+
 import httpx
+from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.trustedhost import TrustedHostMiddleware
+from fastapi.responses import JSONResponse
 
 app = FastAPI(
     title="Climo-Safe API",
@@ -12,15 +16,56 @@ app = FastAPI(
 )
 
 app.add_middleware(
+    TrustedHostMiddleware,
+    allowed_hosts=["localhost", "127.0.0.1"],
+)
+
+app.add_middleware(
     CORSMiddleware,
     allow_origins=[
         "http://localhost:5173",
-        "http://localhost:5174"
+        "http://localhost:5174",
+        "http://127.0.0.1:5173",
+        "http://127.0.0.1:5174",
     ],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_credentials=False,
+    allow_methods=["GET"],
+    allow_headers=["Accept", "Content-Type"],
 )
+
+_rate_limit_window = 60.0
+_rate_limit_requests = 60
+_request_timestamps: defaultdict[str, list[float]] = defaultdict(list)
+
+
+@app.middleware("http")
+async def security_middleware(request: Request, call_next):
+    """Apply basic API throttling and browser security headers."""
+    if request.url.path.startswith("/api/"):
+        client_ip = request.client.host if request.client else "unknown"
+        now = monotonic()
+        recent_requests = [
+            timestamp
+            for timestamp in _request_timestamps[client_ip]
+            if now - timestamp < _rate_limit_window
+        ]
+
+        if len(recent_requests) >= _rate_limit_requests:
+            return JSONResponse(
+                status_code=429,
+                content={"detail": "Too many requests. Please try again later."},
+                headers={"Retry-After": "60"},
+            )
+
+        recent_requests.append(now)
+        _request_timestamps[client_ip] = recent_requests
+
+    response = await call_next(request)
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["Referrer-Policy"] = "no-referrer"
+    response.headers["Content-Security-Policy"] = "default-src 'none'; frame-ancestors 'none'"
+    return response
 
 
 @app.get("/")
@@ -37,7 +82,14 @@ def health():
 
 
 @app.get("/api/dashboard")
-async def dashboard(city: str = "Lahore"):
+async def dashboard(
+    city: str = Query(
+        default="Lahore",
+        min_length=1,
+        max_length=80,
+        pattern=r"^[\w\s.'-]+$",
+    )
+):
 
     async with httpx.AsyncClient(timeout=20.0) as client:
         try:
@@ -122,8 +174,8 @@ async def dashboard(city: str = "Lahore"):
         except HTTPException:
             raise
 
-        except httpx.HTTPError as error:
+        except (httpx.HTTPError, KeyError, TypeError, ValueError):
             raise HTTPException(
                 status_code=502,
-                detail=f"Environmental data service unavailable: {error}"
-            ) from error
+                detail="Environmental data service unavailable"
+            )
